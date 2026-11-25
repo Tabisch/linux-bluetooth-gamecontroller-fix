@@ -9,6 +9,9 @@
 > If you'd rather not install a modified kernel module, see
 > [Alternative without the patch](#alternative-without-the-patch-turn-off-secure-simple-pairing)
 > at the bottom of this page.
+> 
+> If anyone feels up for the task of getting this into mainline, you are more than welcome to take this code.
+> I rather not submit anything, i cannot support myself.
 
 A small kernel patch, packaged with DKMS for Fedora, for Bluetooth game
 controllers that pair fine but disconnect again right after connecting.
