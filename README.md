@@ -70,6 +70,36 @@ and enter that password. This is needed only once.
 sudo ./uninstall.sh   # then reboot
 ```
 
+## Alternative without the patch: turn off Secure Simple Pairing
+
+If you'd rather not install a kernel module, you can work around the problem by
+switching off Secure Simple Pairing (SSP) on the adapter:
+
+```bash
+sudo btmgmt power off
+sudo btmgmt ssp off
+sudo btmgmt power on
+```
+
+The kernel only refuses an early connection on SSP links. With SSP off, the
+link uses legacy pairing and the controller's early request is accepted.
+
+Trade-offs:
+
+- **Weaker security for every Bluetooth device on this adapter**, not just
+  the controller. Legacy (PIN) pairing is much easier to attack than SSP, and
+  Secure Connections is turned off too, because it depends on SSP.
+- Devices that require SSP (many headsets, phones, newer keyboards) may fail to
+  pair, or need to be paired again.
+- You may have to remove and pair the controller again, because its existing
+  link key was created with SSP.
+- **It does not persist.** The setting resets after a reboot, a suspend/resume
+  that resets the adapter, or a restart of `bluetooth.service`, so you have to
+  run the commands again each time.
+
+The patch keeps SSP on and only waits for encryption before accepting the
+connection, so it is the better long-term fix.
+
 ## Notes
 
 - The source comes from the upstream stable tag that matches your kernel
