@@ -1,0 +1,138 @@
+From: linux-bluetooth-gamecontroller-fix
+Subject: [PATCH] Bluetooth: L2CAP: answer "pending" instead of refusing
+ connections that arrive before encryption is enabled
+
+Some BR/EDR HID devices (seen with a "Wireless Controller" gamepad) send
+their L2CAP Connection Request for HID Control (PSM 0x11) right after
+authentication has started, a few milliseconds before the Encryption
+Change event arrives:
+
+  < HCI Link Key Request Reply
+  > L2CAP Connection Request   PSM 0x0011 (HID Control)
+  < L2CAP Connection Response  Refused - security block
+  > HCI Encryption Change      Encryption ON
+
+l2cap_connect() refuses any non-SDP channel on an SSP link that is not
+encrypted yet with L2CAP_CR_SEC_BLOCK, because hci_conn_check_link_mode()
+requires HCI_CONN_ENCRYPT. The device does not retry, so its own HID
+channels are never set up and it disconnects shortly after.
+
+The L2CAP code already knows how to hold an incoming request while the
+link security is being raised: it answers "pending, authentication
+pending" and completes the request from l2cap_security_cfm(). Use that
+path when the only thing missing is encryption on an SSP link, and run
+the full link level check (hci_conn_check_link_mode() plus the
+encryption key size check) again right before such a channel is
+accepted. A link that never becomes encrypted, or ends up not meeting
+the requirements (Secure Connections Only, FIPS, key size), is still
+refused, so no channel is ever accepted on an unencrypted SSP link.
+
+---
+ net/bluetooth/l2cap_core.c | 62 ++++++++++++++++++++++++++++++++++++++++++----
+ 1 file changed
+diff --git a/net/bluetooth/l2cap_core.c b/net/bluetooth/l2cap_core.c
+index 9a1b0ae..f5b588b 100644
+--- a/net/bluetooth/l2cap_core.c
++++ b/net/bluetooth/l2cap_core.c
+@@ -1485,6 +1485,35 @@ static bool l2cap_check_enc_key_size(struct hci_conn *hcon,
+ 		hcon->enc_key_size >= min_key_size);
+ }
+ 
++/* Some BR/EDR devices (e.g. several game controllers) send their L2CAP
++ * Connection Request right after authentication has started, before the
++ * Encryption Change event arrives.  Refusing such a request with
++ * L2CAP_CR_SEC_BLOCK makes these devices give up, so for an SSP link that
++ * is simply not encrypted *yet* the request is answered with "pending"
++ * instead, and completed (or refused) from l2cap_security_cfm() once the
++ * encryption state is known.  The cast keeps this working whether
++ * hci_conn::flags is an unsigned long or a bitmap.
++ */
++static bool l2cap_acl_encrypt_pending(struct hci_conn *hcon)
++{
++	return hcon->type == ACL_LINK && hci_conn_ssp_enabled(hcon) &&
++	       !test_bit(HCI_CONN_ENCRYPT, (unsigned long *)&hcon->flags);
++}
++
++/* Final link level gate before an incoming channel is accepted: the same
++ * checks l2cap_connect() applies up front (SDP is exempt).
++ */
++static bool l2cap_acl_link_ok(struct l2cap_chan *chan)
++{
++	struct hci_conn *hcon = chan->conn->hcon;
++
++	if (chan->psm == cpu_to_le16(L2CAP_PSM_SDP))
++		return true;
++
++	return hci_conn_check_link_mode(hcon) &&
++	       l2cap_check_enc_key_size(hcon, chan);
++}
++
+ static void l2cap_do_start(struct l2cap_chan *chan)
+ {
+ 	struct l2cap_conn *conn = chan->conn;
+@@ -1589,10 +1618,17 @@ static void l2cap_conn_start(struct l2cap_conn *conn)
+ 		} else if (chan->state == BT_CONNECT2) {
+ 			struct l2cap_conn_rsp rsp;
+ 			char buf[128];
++			bool sec_ok;
+ 			rsp.scid = cpu_to_le16(chan->dcid);
+ 			rsp.dcid = cpu_to_le16(chan->scid);
+ 
+-			if (l2cap_chan_check_security(chan, false)) {
++			sec_ok = l2cap_chan_check_security(chan, false);
++			if (sec_ok && !l2cap_acl_link_ok(chan)) {
++				l2cap_state_change(chan, BT_DISCONN);
++				__set_chan_timer(chan, L2CAP_DISC_TIMEOUT);
++				rsp.result = cpu_to_le16(L2CAP_CR_SEC_BLOCK);
++				rsp.status = cpu_to_le16(L2CAP_CS_NO_INFO);
++			} else if (sec_ok) {
+ 				if (test_bit(FLAG_DEFER_SETUP, &chan->flags)) {
+ 					rsp.result = cpu_to_le16(L2CAP_CR_PEND);
+ 					rsp.status = cpu_to_le16(L2CAP_CS_AUTHOR_PEND);
+@@ -4124,10 +4160,14 @@ static void l2cap_connect(struct l2cap_conn *conn, struct l2cap_cmd_hdr *cmd,
+ 
+ 	l2cap_chan_lock(pchan);
+ 
+-	/* Check if the ACL is secure enough (if not SDP) */
++	/* Check if the ACL is secure enough (if not SDP).  An SSP link whose
++	 * encryption is still being set up is not refused here; the request
++	 * is answered with "pending" below and re-checked once encrypted.
++	 */
+ 	if (psm != cpu_to_le16(L2CAP_PSM_SDP) &&
+ 	    (!hci_conn_check_link_mode(conn->hcon) ||
+-	    !l2cap_check_enc_key_size(conn->hcon, pchan))) {
++	    !l2cap_check_enc_key_size(conn->hcon, pchan)) &&
++	    !l2cap_acl_encrypt_pending(conn->hcon)) {
+ 		conn->disc_reason = HCI_ERROR_AUTH_FAILURE;
+ 		result = L2CAP_CR_SEC_BLOCK;
+ 		goto response;
+@@ -4172,7 +4212,8 @@ static void l2cap_connect(struct l2cap_conn *conn, struct l2cap_cmd_hdr *cmd,
+ 	chan->ident = cmd->ident;
+ 
+ 	if (conn->info_state & L2CAP_INFO_FEAT_MASK_REQ_DONE) {
+-		if (l2cap_chan_check_security(chan, false)) {
++		if (l2cap_chan_check_security(chan, false) &&
++		    l2cap_acl_link_ok(chan)) {
+ 			if (test_bit(FLAG_DEFER_SETUP, &chan->flags)) {
+ 				l2cap_state_change(chan, BT_CONNECT2);
+ 				result = L2CAP_CR_PEND;
+@@ -7701,7 +7742,18 @@ static void l2cap_security_cfm(struct hci_conn *hcon, u8 status, u8 encrypt)
+ 			struct l2cap_conn_rsp rsp;
+ 			__u16 res, stat;
+ 
+-			if (!status && l2cap_check_enc_key_size(hcon, chan)) {
++			/* Authenticated but encryption not on yet: keep the
++			 * request pending until the Encryption Change event.
++			 */
++			if (!status && !l2cap_acl_link_ok(chan) &&
++			    l2cap_acl_encrypt_pending(hcon)) {
++				l2cap_chan_check_security(chan, false);
++				l2cap_chan_unlock(chan);
++				continue;
++			}
++
++			if (!status && l2cap_acl_link_ok(chan) &&
++			    l2cap_check_enc_key_size(hcon, chan)) {
+ 				if (test_bit(FLAG_DEFER_SETUP, &chan->flags)) {
+ 					res = L2CAP_CR_PEND;
+ 					stat = L2CAP_CS_AUTHOR_PEND;
